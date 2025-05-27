@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Application Infrastructure Stack for WordPress (Does not incude PHP set up)
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of existing EC2 KeyPair for SSH
+    Default: WordPressKey
+
+Mappings:
+  AWSRegionToAMI:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-west-2:
+      AMI: ami-0e34e7b9ca0ace12d
+
+Resources:
+  # IAM Role with permissions including SecretsManager
+  LabRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LabRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+        - arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess
+        - arn:aws:iam::aws:policy/AutoScalingFullAccess
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+
+  LabInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: LabRole
+      Roles:
+        - !Ref LabRole
+
+  # Store RDS credentials in Secrets Manager
+  RDSSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: wordpress-rds-secret
+      Description: RDS credentials for WordPress
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: "\"@/\\'"
+      Tags:
+        - Key: Name
+          Value: WordPressRDSPassword
+
+  # S3 Bucket for WordPress media
+  WordPressMediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: wordpressmybuckets3
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      VersioningConfiguration:
+        Status: Suspended
+    DeletionPolicy: Retain
+    
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WordPressMediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowPublicReadAccessToUploads
+            Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${WordPressMediaBucket}/*"
+
+  # RDS Subnet Group (private subnets)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Private DB Subnets"
+      SubnetIds:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      DBSubnetGroupName: wordpress-dbsubnetgroup
+
+  # Primary RDS Instance (MySQL)
+  MyDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: wordpress-db
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: 8.0.35
+      MasterUsername: !Sub "{{resolve:secretsmanager:${RDSSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${RDSSecret}:SecretString:password}}"
+      DBName: WordPress
+      VPCSecurityGroups:
+        - !ImportValue SGRDS
+      MultiAZ: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+
+  # RDS Read Replica
+  MyDBReplica:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      SourceDBInstanceIdentifier: !Ref MyDB
+      DBInstanceIdentifier: wordpress-db-replica
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      PubliclyAccessible: false
+
+  # Bastion Host in PublicSubnet1
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !FindInMap [AWSRegionToAMI, !Ref "AWS::Region", AMI]
+      KeyName: !Ref KeyName
+      SubnetId: !ImportValue PublicSubnet1
+      SecurityGroupIds:
+        - !ImportValue SGBastion
+      IamInstanceProfile: !Ref LabInstanceProfile
+      Tags:
+        - Key: Name
+          Value: BastionHost
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: wordpress-alb
+      Subnets:
+        - !ImportValue PublicSubnet1
+        - !ImportValue PublicSubnet2
+      SecurityGroups:
+        - !ImportValue SGELB
+      Scheme: internet-facing
+      Type: application
+
+  # Target Group for ALB
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: wordpress-tg
+      VpcId: !ImportValue VPCID
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200-399
+
+  # Listener for ALB
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # Launch Template for EC2 (WordPress AMI, minimal setup)
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: wordpress-ami-lt
+      LaunchTemplateData:
+        ImageId: !FindInMap [AWSRegionToAMI, !Ref "AWS::Region", AMI]
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt LabInstanceProfile.Arn
+        SecurityGroupIds:
+          - !ImportValue SGWebServer
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum -y update
+            yum -y install httpd php php-mysqlnd wget unzip
+            systemctl enable httpd
+            systemctl start httpd
+
+            # Manual Setup using User Data
+            cd /var/www/html
+            wget https://wordpress.org/latest.tar.gz -O /tmp/latest.tar.gz
+            tar -xzf /tmp/latest.tar.gz -C /tmp
+            cp -r /tmp/wordpress/* /var/www/html/
+            chown -R apache:apache /var/www/html
+
+  # Auto Scaling Group
+  WordPressASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+
+  # ASG Scaling Policies
+  ASGScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+
+  ASGScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 25.0
+
+Outputs:
+  ALBDNSName:
+    Description: ALB DNS Name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  RDSPrimaryEndpoint:
+    Description: Primary RDS Endpoint
+    Value: !GetAtt MyDB.Endpoint.Address
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref WordPressMediaBucket
+  WebServerASG:
+    Description: WordPress Auto Scaling Group Name
+    Value: !Ref WordPressASG
+  BastionHostID:
+    Description: Bastion Host Instance ID
+    Value: !Ref BastionHost
+  BastionHostPublicIP:
+    Description: Bastion Host Public IP
+    Value: !GetAtt BastionHost.PublicIp
+  SecretArn:
+    Description: RDS Secret ARN
+    Value: !Ref RDSSecret
